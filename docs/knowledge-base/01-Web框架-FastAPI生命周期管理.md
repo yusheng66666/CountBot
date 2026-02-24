@@ -85,7 +85,74 @@ async def lifespan(app):
 - 停止调度器
 - 输出关闭日志
 
-## 6、为什么不用 @app.on_event
+## 6、yield 之后的代码何时执行
+
+yield 之后的代码（关闭逻辑）在应用收到**正常关闭信号**时执行：
+
+```
+Ctrl+C / kill / docker stop
+    ↓
+Uvicorn 收到 SIGTERM 或 SIGINT 信号
+    ↓
+Uvicorn 通知 FastAPI："要关闭了"
+    ↓
+FastAPI 从 yield 处恢复，执行 yield 之后的代码
+    ↓
+await channel_manager.stop_all()
+await scheduler.stop()
+    ↓
+Uvicorn 关闭 HTTP 服务
+```
+
+### （1）不同关闭方式的对比
+
+| 触发方式 | yield 之后执行？ | 说明 |
+|----------|:-:|------|
+| 终端 `Ctrl+C`（SIGINT） | 是 | 最常见的开发期关闭方式 |
+| `kill <pid>`（SIGTERM） | 是 | 默认的 kill 信号，Uvicorn 能捕获 |
+| `docker stop`（发 SIGTERM） | 是 | Docker 先发 SIGTERM，等 10 秒后才发 SIGKILL |
+| `kill -9 <pid>`（SIGKILL） | **否** | 操作系统直接终结进程，程序无法捕获 |
+| 进程崩溃（段错误等） | **否** | 进程已经异常退出 |
+
+### （2）SIGTERM vs SIGKILL
+
+- **SIGTERM**（信号 15）：礼貌地请求进程退出，进程可以捕获并做清理
+- **SIGKILL**（信号 9）：操作系统强制杀死进程，进程没有任何反应机会
+
+```bash
+kill 1234          # 发送 SIGTERM → 进程有机会优雅关闭
+kill -9 1234       # 发送 SIGKILL → 进程直接死亡，不执行任何清理代码
+```
+
+### （3）Java 对比
+
+| 概念 | Python FastAPI | Java Spring Boot |
+|------|----------------|------------------|
+| 正常关闭时的清理 | lifespan yield 之后 | `@PreDestroy` / `DisposableBean.destroy()` |
+| 兜底清理机制 | `atexit.register()` | `Runtime.addShutdownHook()` |
+| 不可捕获的强制退出 | `kill -9` | `Runtime.halt()` 或 `kill -9` |
+
+### （4）atexit 兜底机制
+
+本项目中除了 yield 之后的关闭代码，还注册了 `atexit` 回调作为兜底：
+
+```python
+import atexit
+
+def cleanup_on_exit():
+    # 在新的事件循环中运行异步清理代码
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(channel_manager.stop_all())
+    loop.close()
+
+atexit.register(cleanup_on_exit)
+```
+
+正常关闭时两者都会执行（先 yield 之后的代码，再 atexit）。atexit 是为了覆盖一些边缘情况，比如 Uvicorn 自身异常导致 lifespan 关闭流程没被正确触发。
+
+`kill -9` 时两者**都不会执行**——这是操作系统的限制，任何编程语言都无法绕过。
+
+## 7、为什么不用 @app.on_event
 
 旧版 FastAPI 用 `@app.on_event("startup")` 和 `@app.on_event("shutdown")`，但这种写法已被废弃。Lifespan 方式更好，因为：
 

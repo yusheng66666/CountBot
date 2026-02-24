@@ -17,13 +17,13 @@ dialect+driver://username:password@host:port/database
 
 各部分含义：
 
-| 部分 | 说明 | 示例 |
-|------|------|------|
-| dialect | 数据库类型 | `sqlite`、`mysql`、`postgresql` |
-| driver | Python 驱动库 | `aiosqlite`（异步）、`pymysql`、`psycopg2` |
-| username:password | 认证信息 | SQLite 不需要 |
-| host:port | 服务器地址 | SQLite 不需要（是本地文件） |
-| database | 数据库名/路径 | `/path/to/countbot.db` |
+| 部分                | 说明         | 示例                                   |
+| ----------------- | ---------- | ------------------------------------ |
+| dialect           | 数据库类型      | `sqlite`、`mysql`、`postgresql`        |
+| driver            | Python 驱动库 | `aiosqlite`（异步）、`pymysql`、`psycopg2` |
+| username:password | 认证信息       | SQLite 不需要                           |
+| host:port         | 服务器地址      | SQLite 不需要（是本地文件）                    |
+| database          | 数据库名/路径    | `/path/to/countbot.db`               |
 
 ### （1）为什么有两个 URL？
 
@@ -109,14 +109,42 @@ sync_engine = create_engine(SYNC_DATABASE_URL, echo=False, future=True)
 
 ### （2）参数说明
 
-| 参数 | 值 | 说明 |
-|------|---|------|
-| `echo` | `False` | 是否在控制台打印所有 SQL 语句（调试时可设为 `True`） |
-| `future` | `True` | 使用 SQLAlchemy 2.0 风格 API（向前兼容） |
+| 参数       | 值       | 说明                               |
+| -------- | ------- | -------------------------------- |
+| `echo`   | `False` | 是否在控制台打印所有 SQL 语句（调试时可设为 `True`） |
+| `future` | `True`  | 使用 SQLAlchemy 2.0 风格 API（向前兼容）   |
 
 ### （3）为什么需要同步引擎和异步引擎？
 
 项目主体是异步的（FastAPI），所以主要用异步引擎。但某些场景无法使用异步（比如在同步回调、Alembic 迁移脚本中），就需要同步引擎作为补充。两个引擎连接同一个数据库文件，只是访问方式不同。
+
+核心区别在于**异步引擎的操作需要 `await`，同步引擎不需要**：
+
+```python
+# 异步引擎 — 所有操作都是协程，需要 await
+async with engine.begin() as conn:
+    await conn.run_sync(Base.metadata.create_all)
+
+async with AsyncSessionLocal() as session:
+    result = await session.execute(select(User))
+    await session.commit()
+
+# 同步引擎 — 普通函数调用，不需要 await
+with sync_engine.begin() as conn:
+    Base.metadata.create_all(conn)
+
+with SessionLocal() as session:
+    result = session.execute(select(User))
+    session.commit()
+```
+
+|        | 异步引擎                         | 同步引擎                   |
+| ------ | ---------------------------- | ---------------------- |
+| 上下文管理器 | `async with`                 | `with`                 |
+| 执行查询   | `await session.execute(...)` | `session.execute(...)` |
+| 提交事务   | `await session.commit()`     | `session.commit()`     |
+| 使用场景   | `async def` 函数内              | 普通 `def` 函数内           |
+| 等待时    | 释放控制权，不阻塞事件循环                | 阻塞当前线程                 |
 
 ## 4、会话工厂（Session Factory）是什么？
 
@@ -126,15 +154,15 @@ from sqlalchemy.orm import sessionmaker
 
 # 异步会话工厂
 AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
+    engine,                    # 绑定异步引擎，会话通过这个引擎获取数据库连接
+    class_=AsyncSession,       # 指定创建 AsyncSession 类型（支持 await 的会话）
+    expire_on_commit=False,    # commit 后不过期对象，避免关闭会话后访问属性报错
 )
 
 # 同步会话工厂
 SessionLocal = sessionmaker(
-    sync_engine,
-    expire_on_commit=False,
+    sync_engine,               # 绑定同步引擎
+    expire_on_commit=False,    # 同上，commit 后对象属性仍可直接访问
 )
 ```
 
@@ -167,19 +195,32 @@ Session（会话）是**与数据库交互的工作区**，负责：
 
 ### （3）expire_on_commit=False 是什么意思？
 
-默认情况下，`commit()` 之后 Session 会将所有对象标记为"过期"，下次访问属性时会重新查询数据库。设置 `expire_on_commit=False` 后，`commit()` 之后对象的属性仍然可用，不会触发额外查询。
+`expire_on_commit` 控制的是：**commit 之后、Session 还活着的期间**，对象属性是否标记为"过期"。
 
 ```python
-# expire_on_commit=True（默认）
-await session.commit()
-print(user.name)  # 触发一次 SELECT 查询来刷新数据
+async with AsyncSessionLocal() as session:
+    user = await session.get(User, 1)   # 查询，user.name = "张三"
+    user.name = "李四"
+    await session.commit()              # ← expire_on_commit 在这里生效
 
-# expire_on_commit=False（本项目设置）
-await session.commit()
-print(user.name)  # 直接返回内存中的值，不查询
+    # Session 还活着，commit 已经执行
+    print(user.name)
+    # expire_on_commit=True（默认） → 对象已过期，访问属性会自动查一次数据库
+    # expire_on_commit=False       → 直接返回内存中的 "李四"，不查数据库
+
+# Session 已关闭
+print(user.name)
+# 如果对象已过期（True）  → 尝试查数据库 → 连接已关闭 → 报错！
+# 如果对象未过期（False） → 直接返回内存值 → 正常工作
 ```
 
-在异步环境中，这个设置尤其重要——如果在 `await session.commit()` 之后、Session 关闭之后访问对象属性，默认行为会尝试用已关闭的连接查询，导致报错。
+#### （3.1）SQLAlchemy 为什么默认设为 True？
+
+为了**数据一致性**。在同步 Web 框架中，一个请求内可能多次 commit，两次 commit 之间其他请求可能修改了同一条数据。标记过期后，下次访问会重新查询，保证拿到最新值。
+
+#### （3.2）CountBot 为什么设为 False？
+
+FastAPI 的异步模式中，通常 commit 后很快就关闭 Session。如果对象被标记为过期，在 Session 关闭后访问属性就会尝试用已关闭的连接查询，直接报错。设为 `False` 避免了这个问题——代价是内存中的值可能不是数据库最新的，但对于"commit 后立即关闭 Session"的使用模式来说，这个取舍是合理的。
 
 ### （4）class_=AsyncSession 是什么？
 
@@ -226,6 +267,26 @@ async def get_users(db: AsyncSession = Depends(get_db)):
 
 每个请求都会自动获得一个独立的数据库会话，请求结束后自动关闭。
 
+### （4）Depends 是什么？
+
+`Depends` 是 FastAPI 的**依赖注入**机制。`Depends(get_db)` 告诉 FastAPI："调用这个接口之前，先执行 `get_db()` 函数，把它的返回值注入到参数中。"
+
+整个流程：
+
+```
+用户请求 GET /users
+    │
+    ├── 1. FastAPI 看到 Depends(get_db)
+    ├── 2. 自动调用 get_db()，创建一个数据库会话
+    ├── 3. 把会话注入到 db 参数
+    ├── 4. 执行 get_users() 函数体
+    └── 5. 函数返回后，get_db() 中的 async with 退出，自动关闭会话
+```
+
+好处是**解耦**——`get_users` 不需要知道会话怎么创建、怎么关闭，只管用。如果以后换了数据库配置，只改 `get_db()` 就行，所有接口函数不用动。
+
+这和 Java Spring 的 `@Autowired` 是类似的思想，只是 FastAPI 用函数参数默认值的方式实现，不需要注解和容器。
+
 ## 6、get_db_session_factory() 是做什么的？
 
 ```python
@@ -240,12 +301,29 @@ def get_db_session_factory():
 
 ```python
 # Cron 调度器的用法
-factory = get_db_session_factory()
+factory = get_db_session_factory()  # 拿到 AsyncSessionLocal（工厂对象）
 
 async def run_cron_job():
-    async with factory() as session:  # 自己创建会话
+    # factory() → 调用工厂，返回一个 AsyncSession 实例
+    # async with  → 对这个实例使用上下文管理器（退出时自动关闭）
+    async with factory() as session:
         # 执行定时任务...
         await session.commit()
+```
+
+注意 `factory()` 有括号——是先**调用工厂**得到一个 `AsyncSession` 实例，再对实例做 `async with`，不是对工厂本身做 `async with`。
+
+和 `get_db()` 对比：
+
+```python
+# get_db() — FastAPI 自动调用，自动管理会话生命周期
+async def get_users(db: AsyncSession = Depends(get_db)):
+    await db.execute(...)
+
+# get_db_session_factory() — 拿到工厂，自己决定何时创建、何时关闭
+factory = get_db_session_factory()
+async with factory() as session:
+    await session.execute(...)
 ```
 
 ### （2）为什么不直接 import AsyncSessionLocal？
@@ -257,11 +335,15 @@ async def run_cron_job():
 ```python
 async def init_db() -> None:
     """初始化数据库"""
+    # 延迟导入所有模型类，import 时它们会自动注册到 Base.metadata
     from backend.models import CronJob, Message, Personality, Session, Setting, Task, ToolConversation
 
+    # engine.begin() → 获取一个数据库连接并开启事务（正常退出自动 commit，异常自动 rollback）
     async with engine.begin() as conn:
+        # create_all 是同步方法，run_sync 把它放到线程池执行，不阻塞事件循环
         await conn.run_sync(Base.metadata.create_all)
 
+    # 建表完成后，插入内置的性格预设数据
     await init_personalities()
 ```
 
@@ -295,9 +377,152 @@ Base.metadata.create_all(conn)
 await conn.run_sync(Base.metadata.create_all)
 ```
 
-`run_sync` 内部会在线程池中执行同步函数，不阻塞事件循环。
+`run_sync` 内部的执行流程：
 
-## 8、整体架构图
+```
+await conn.run_sync(Base.metadata.create_all)
+
+1. run_sync 收到同步函数 create_all
+2. 把 create_all 提交到线程池执行（内部调用 loop.run_in_executor）
+3. 返回一个协程
+4. await 这个协程 → 当前协程挂起，事件循环去处理其他任务
+5. 线程池中 create_all 执行完毕 → 协程恢复，继续往下走
+```
+
+虽然 `await` 通常用于等待协程，但这里等待的本质是"线程池中的同步任务完成"。`run_sync` 把同步操作包装成了协程的形式，让调用者可以用统一的 `await` 语法来等待。这是异步编程中处理"不得不调用同步代码"的标准做法。
+
+## 8、init_personalities() 数据初始化模式
+
+```python
+async def init_personalities() -> None:
+    """初始化内置性格数据（如果表为空）"""
+    from backend.models.personality import Personality  # 延迟导入，避免循环依赖
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as session:         # 自己创建会话（不在 HTTP 请求中）
+        try:
+            # 先查一下表里有没有数据
+            result = await session.execute(select(Personality))
+            existing = result.scalars().first()
+
+            if existing:
+                return  # 已有数据，跳过，避免重复插入
+
+            # 从预设配置中导入内置性格数据
+            from backend.modules.agent.personalities import PERSONALITY_PRESETS
+
+            # 逐条创建 ORM 对象并加入会话
+            for pid, data in PERSONALITY_PRESETS.items():
+                personality = Personality(
+                    id=pid,
+                    name=data["name"],
+                    description=data["description"],
+                    # ...其他字段...
+                )
+                session.add(personality)       # 添加到会话（暂未写入数据库）
+
+            await session.commit()             # 一次性提交所有新增记录
+
+        except Exception:
+            await session.rollback()           # 出错时回滚，撤销所有未提交的变更
+            pass                               # 静默失败，不影响应用启动
+```
+
+### （1）这个函数体现了哪些 SQLAlchemy 模式？
+
+**查询模式** — `select` + `execute` + `scalars`：
+
+```python
+result = await session.execute(select(Personality))  # 执行 SELECT 查询
+existing = result.scalars().first()                   # 取第一条结果
+```
+
+- `select(Personality)` → 构造 SQL：`SELECT * FROM personality`
+- `session.execute()` → 执行查询，返回 `Result` 对象
+- `.scalars()` → 把结果从 `Row` 元组转为 ORM 对象
+- `.first()` → 取第一条，没有则返回 `None`
+
+**写入模式** — `add` + `commit`：
+
+```python
+session.add(personality)    # 告诉 Session "我要新增这条记录"
+await session.commit()      # 真正写入数据库
+```
+
+`session.add()` 只是把对象放入 Session 的"待处理队列"，不会立即执行 SQL。`commit()` 时才会一次性生成 `INSERT` 语句并写入数据库。
+
+**错误处理模式** — `try` + `rollback`：
+
+```python
+try:
+    # 执行多步数据库操作...
+    await session.commit()
+except Exception:
+    await session.rollback()   # 出错时撤销所有变更，保证数据一致性
+```
+
+`rollback()` 会撤销本次事务中所有未 commit 的变更，防止"插了一半数据"的情况。
+
+### （2）为什么用 AsyncSessionLocal() 而不是 get_db()？
+
+`init_personalities()` 在应用启动时调用（`lifespan` 阶段），此时还没有 HTTP 请求，不在 FastAPI 的依赖注入上下文中。所以直接用 `AsyncSessionLocal()` 自己创建会话，和前面 `get_db_session_factory()` 的使用场景类似。
+
+### （3）Personality 模型定义解读
+
+`init_personalities()` 操作的就是 `Personality` 模型，看看它的定义：
+
+```python
+class Personality(Base):                    # 继承 Base，自动注册到 metadata
+    """性格表"""
+    __tablename__ = "personalities"          # 对应数据库中的表名
+
+    # Mapped[str] — 类型注解，告诉 IDE 和类型检查器这个字段是 str 类型
+    # mapped_column(...) — 定义数据库列的具体约束
+
+    id: Mapped[str] = mapped_column(
+        String(50),          # SQL 类型：VARCHAR(50)
+        primary_key=True     # 主键
+    )
+    name: Mapped[str] = mapped_column(
+        String(100),         # VARCHAR(100)
+        nullable=False       # NOT NULL，不允许为空
+    )
+    description: Mapped[str] = mapped_column(
+        Text,                # TEXT 类型，不限长度
+        nullable=False
+    )
+    traits: Mapped[List[str]] = mapped_column(
+        JSON,                # JSON 类型，存储列表 ["暴躁", "嘴硬心软"]
+        nullable=False
+    )
+    icon: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="Smile"      # 默认值：不传时自动填入 "Smile"
+    )
+    is_builtin: Mapped[bool] = mapped_column(
+        Boolean,             # BOOLEAN 类型
+        nullable=False,
+        default=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow    # 创建时自动填入当前时间
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow   # 每次更新记录时自动刷新时间
+    )
+```
+
+这是 SQLAlchemy 2.0 的声明式模型写法。`Mapped[str]` 是 Python 类型注解，`mapped_column(String(50))` 是数据库列定义，两者配合让代码同时具备**类型检查**和**数据库映射**能力。
+
+### （4）为什么静默失败？
+
+性格预设数据是"有了更好，没有也不影响核心功能"的数据。如果初始化失败（比如数据格式有误），不应该阻止整个应用启动。所以用 `except Exception: pass` 吞掉异常。
+
+## 9、整体架构图
 
 ```
 database.py 的对象关系：
