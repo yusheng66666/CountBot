@@ -230,29 +230,74 @@ class ContextBuilder:
         text: str,
         media: list[str] | None
     ) -> str | list[dict[str, Any]]:
-        """构建用户消息内容，可选 base64 编码的图片"""
+        """构建用户消息内容，支持纯文本和图文混合（多模态）两种格式。
+
+        返回值有两种形态：
+          - 纯文本：直接返回 str，对应 LLM 消息中 content 为字符串的情况
+          - 图文混合：返回 list[dict]，符合 OpenAI 多模态消息格式（LiteLLM 会自动适配各家 LLM）
+
+        多模态消息格式示例（OpenAI 规范）：
+          [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}},
+            {"type": "text", "text": "请描述这张图片"}
+          ]
+
+        Args:
+            text: 用户输入的文本内容
+            media: 附件文件路径列表（可为 None），目前仅处理图片类型
+
+        Returns:
+            str: 纯文本（无图片时）
+            list[dict]: 多模态内容数组（有图片时），图片在前、文本在后
+        """
+        # 无附件 → 直接返回纯文本，走最简单的路径
         if not media:
             return text
-        
+
         images = []
         for path in media:
             p = Path(path)
+
+            # mimetypes.guess_type() — Python 标准库，根据文件扩展名猜测 MIME 类型
+            # 返回 (type, encoding) 元组，例如：
+            #   "photo.png"  → ("image/png", None)
+            #   "doc.pdf"    → ("application/pdf", None)
+            #   "data.gz"    → ("application/gzip", "gzip")
+            #   "unknown"    → (None, None)
+            # 这里只取第一个值（MIME 类型），第二个值（编码）用 _ 丢弃
             mime, _ = mimetypes.guess_type(path)
+
+            # 三重过滤：文件必须存在 + MIME 类型识别成功 + 必须是图片类型
+            # 非图片文件（如 PDF、音频）会被静默跳过
             if not p.is_file() or not mime or not mime.startswith("image/"):
                 continue
+
             try:
+                # Path.read_bytes() — 一次性读取文件的全部字节内容
+                # base64.b64encode() — 将二进制数据编码为 Base64 字节串
+                # .decode() — 将 Base64 字节串转为普通字符串（因为 JSON 只接受字符串）
+                #
+                # 完整过程：图片文件 → bytes → base64 bytes → str
+                # 例如：一张 100KB 的 PNG 图片，编码后约 133KB 的 base64 字符串
                 b64 = base64.b64encode(p.read_bytes()).decode()
+
+                # 构造 Data URL 格式：data:{MIME类型};base64,{编码后的数据}
+                # 这是浏览器的标准格式，LLM API 也采用了这个规范来内联传输图片
+                # 例如："data:image/png;base64,iVBORw0KGgo..."
                 images.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"}
                 })
             except Exception as e:
+                # 读取或编码失败（文件权限、损坏等）不中断流程，跳过这张图继续处理
                 logger.warning(f"Failed to encode image {path}: {e}")
-        
+
+        # 所有图片都处理失败或都不是图片类型 → 退化为纯文本
         if not images:
             return text
-        
-        # 返回多模态内容
+
+        # 图片放在文本前面：LLM 会先"看到"图片再读到文字提问
+        # 这个顺序是 OpenAI 推荐的，有助于 LLM 理解"这段文字是在问关于这些图片的问题"
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
