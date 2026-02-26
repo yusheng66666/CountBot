@@ -39,7 +39,10 @@ class LiteLLMProvider(LLMProvider):
             litellm.set_verbose = False
             litellm.drop_params = True
             litellm.telemetry = False
-            
+
+            # 禁用流式 usage 计算（避免某些 provider 返回非标准 chunk 格式时报错）
+            litellm.calculate_usage = False
+
             # 禁用 tiktoken 以避免编码错误
             # 这会让 LiteLLM 跳过 token 计数，直接发送请求
             os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"

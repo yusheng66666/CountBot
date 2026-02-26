@@ -17,9 +17,10 @@ from fastapi import WebSocket, WebSocketDisconnect, status
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-# 全局取消令牌管理器
+# 全局取消令牌管理器（用于支持 /stop 命令取消正在进行的 Agent 任务）
 from backend.modules.agent.task_manager import CancellationToken
 
+# 每个会话一个取消令牌，key 是 session_id
 _session_cancel_tokens: dict[str, CancellationToken] = {}
 
 
@@ -61,17 +62,17 @@ def cleanup_cancel_token(session_id: str):
 
 
 class ClientMessage(BaseModel):
-    """客户端发送的消息"""
+    """客户端发送的消息（前端 → 后端）"""
 
-    type: str = Field(..., description="消息类型")
+    type: str = Field(..., description="消息类型")           # "chat" / "ping" / "stop" 等
     session_id: str = Field(..., alias="sessionId", description="会话 ID")
     content: str | None = Field(None, description="消息内容（ping 消息可选）")
 
 
 class ServerMessage(BaseModel):
-    """服务器发送的消息基类"""
+    """服务器发送的消息基类（后端 → 前端）"""
 
-    type: str = Field(..., description="消息类型")
+    type: str = Field(..., description="消息类型")  # 子类有 message_chunk / tool_call / tool_result / error 等
 
     def to_json(self) -> str:
         """转换为 JSON 字符串"""
@@ -142,12 +143,14 @@ class ConnectionManager:
     def __init__(self):
         """初始化连接管理器"""
         # 存储所有活跃连接: {connection_id: websocket}
+        # 每个浏览器标签页打开前端就会创建一个 WebSocket 连接
         self._connections: dict[str, WebSocket] = {}
 
-        # 存储会话到连接的映射: {session_id: set(connection_id)}
+        # 会话到连接的映射: {session_id: set(connection_id)}
+        # 一个会话可以有多个连接（多个标签页看同一个会话）
         self._session_connections: dict[str, set[str]] = {}
 
-        # 连接锁，防止并发修改
+        # 连接锁，防止并发修改（多个 WebSocket 可能同时连接/断开）
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket, connection_id: str | None = None) -> str:
@@ -164,7 +167,7 @@ class ConnectionManager:
             connection_id = str(uuid.uuid4())
 
         async with self._lock:
-            await websocket.accept()
+            await websocket.accept()  # 完成 WebSocket 握手，接受浏览器的连接请求
             self._connections[connection_id] = websocket
             logger.info(f"WebSocket 连接已建立: {connection_id}")
 
@@ -289,7 +292,7 @@ class ConnectionManager:
 # Global Connection Manager Instance
 # ============================================================================
 
-# 全局连接管理器实例
+# 全局单例：整个应用共享一个连接管理器
 connection_manager = ConnectionManager()
 
 
@@ -323,12 +326,12 @@ async def handle_websocket(websocket: WebSocket, agent_loop=None):
             ServerMessage(type="connected"),
         )
 
-        # 如果提供了 agent_loop，使用事件循环处理
+        # 正常模式：使用 events.py 中的事件循环处理消息（支持流式响应、工具调用等）
         if agent_loop:
             from backend.ws.events import websocket_event_loop
             await websocket_event_loop(websocket, connection_id, agent_loop)
         else:
-            # 简单的消息处理循环（用于测试）
+            # 简单模式（用于测试）：仅接收消息并返回确认，不调用 Agent
             while True:
                 try:
                     # 接收客户端消息

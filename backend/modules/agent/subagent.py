@@ -120,27 +120,34 @@ class SubagentManager:
     async def execute_task(self, task_id: str) -> None:
         """
         执行后台任务
-        
+
         Args:
             task_id: 任务 ID
-            
+
         Raises:
             ValueError: 任务不存在
         """
         task = self.tasks.get(task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
-        
+
         if task.status != TaskStatus.PENDING:
             logger.warning(f"Task {task_id} is not pending, current status: {task.status}")
             return
-        
+
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.now()
         task.progress = 0
-        
+
         logger.info(f"Starting task {task_id}: {task.label}")
-        
+
+        # 发送任务创建通知
+        try:
+            from backend.ws.task_notifications import notify_task_created
+            await notify_task_created(task_id, task.label)
+        except Exception as e:
+            logger.debug(f"Task notification failed (non-fatal): {e}")
+
         # 创建异步任务
         async_task = asyncio.create_task(self._run_task(task))
         self.running_tasks[task_id] = async_task
@@ -256,39 +263,111 @@ class SubagentManager:
                             "name": tool_call.name,
                             "content": result,
                         })
-                        
+
                         task.progress = min(90, task.progress + 5)
+                        # 推送进度更新
+                        try:
+                            from backend.ws.task_notifications import notify_task_progress
+                            await notify_task_progress(task.task_id, task.progress)
+                        except Exception:
+                            pass
                 else:
                     # 没有工具调用，完成
                     break
-            
+
             # 任务完成
             task.result = "".join(response_chunks)
             task.status = TaskStatus.COMPLETED
             task.progress = 100
             task.completed_at = datetime.now()
-            
+
             logger.info(f"Task {task.task_id} completed successfully")
-            
+
+            # 推送完成通知
+            try:
+                from backend.ws.task_notifications import notify_task_complete
+                await notify_task_complete(task.task_id, task.result)
+            except Exception as e:
+                logger.debug(f"Task complete notification failed: {e}")
+
+            # 将结果推送到聊天界面并持久化
+            await self._deliver_result_to_session(task)
+
         except asyncio.CancelledError:
             # 任务被取消
             task.status = TaskStatus.CANCELLED
             task.completed_at = datetime.now()
-            
+
             logger.info(f"Task {task.task_id} was cancelled")
-            
+
+            # 推送失败通知（取消也视为一种失败）
+            try:
+                from backend.ws.task_notifications import notify_task_failed
+                await notify_task_failed(task.task_id, "任务已取消")
+            except Exception:
+                pass
+
+            await self._deliver_result_to_session(task)
+
         except Exception as e:
             # 任务失败
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
-            
+
             logger.error(f"Task {task.task_id} failed: {e}")
+
+            # 推送失败通知
+            try:
+                from backend.ws.task_notifications import notify_task_failed
+                await notify_task_failed(task.task_id, str(e))
+            except Exception:
+                pass
+
+            await self._deliver_result_to_session(task)
             
         finally:
             # 清理运行中的任务
             if task.task_id in self.running_tasks:
                 del self.running_tasks[task.task_id]
+
+    async def _deliver_result_to_session(self, task: SubagentTask) -> None:
+        """将子代理结果推送到聊天界面并持久化到数据库"""
+        if not task.session_id:
+            return
+
+        try:
+            # 构造推送内容
+            if task.status == TaskStatus.COMPLETED:
+                content = f"**子代理任务「{task.label}」已完成**\n\n{task.result or '（无返回内容）'}"
+            elif task.status == TaskStatus.CANCELLED:
+                content = f"**子代理任务「{task.label}」已取消**"
+            else:
+                content = f"**子代理任务「{task.label}」失败**: {task.error or '未知错误'}"
+
+            # 1. 通过 WebSocket 实时推送到前端聊天界面
+            # TODO: 目前只支持 WebSocket 推送，飞书/Telegram 等渠道用户收不到实时结果
+            #       需要增加 channel/chat_id 字段，通过 ChannelManager 投递（参考 CronExecutor._deliver_to_channel）
+            from backend.ws.connection import send_message_chunk, send_message_complete
+            await send_message_chunk(task.session_id, content)
+            await send_message_complete(task.session_id, message_id=f"subagent-{task.task_id}")
+
+            # 2. 持久化到数据库，刷新页面后也能看到
+            from backend.database import get_db_session_factory
+            from backend.models.message import Message
+            db_factory = get_db_session_factory()
+            async with db_factory() as db:
+                db.add(Message(
+                    session_id=task.session_id,
+                    role="assistant",
+                    content=content,
+                ))
+                await db.commit()
+
+            logger.info(f"Subagent result delivered to session {task.session_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to deliver subagent result to session: {e}")
 
     def _build_subagent_prompt(self, task: str) -> str:
         """
@@ -443,14 +522,6 @@ class SubagentManager:
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self.running_tasks)
-
-    def register_notification_callback(self, callback) -> None:
-        """注册通知回调函数（保留兼容性）"""
-        pass
-
-    async def _notify(self, task_id: str, event_type: str) -> None:
-        """发送通知（保留兼容性）"""
-        pass
 
     def get_stats(self) -> dict[str, int]:
         """

@@ -46,18 +46,22 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """根据配置初始化已启用的频道。"""
+        # 获取配置中的 channels 节（包含 telegram/feishu/dingtalk 等子配置）
         channels_config = getattr(self.config, "channels", None)
         if not channels_config:
             logger.info("No channels configuration found")
             return
 
+        # 遍历 _CHANNEL_REGISTRY 中注册的所有渠道
         for name, (module_path, class_name) in _CHANNEL_REGISTRY.items():
+            # 获取该渠道的配置，跳过未配置或未启用的渠道
             channel_cfg = getattr(channels_config, name, None)
             if not channel_cfg or not getattr(channel_cfg, "enabled", False):
                 continue
             try:
+                # 动态导入渠道模块并实例化（如 "backend.modules.channels.telegram" -> TelegramChannel）
                 module = __import__(module_path, fromlist=[class_name])
-                cls = getattr(module, class_name)
+                cls = getattr(module, class_name) 
                 self.channels[name] = cls(channel_cfg)
                 logger.debug(f"{class_name} initialized")
             except ImportError as e:
@@ -67,6 +71,7 @@ class ChannelManager:
 
         logger.info(f"Initialized {len(self.channels)} channel(s): {list(self.channels.keys())}")
 
+        # 为每个渠道注入消息回调：渠道收到消息后会调用此回调，将消息发布到消息总线
         for channel in self.channels.values():
             channel.set_message_callback(self._on_inbound_message)
 

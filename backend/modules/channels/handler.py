@@ -186,7 +186,7 @@ class ChannelMessageHandler:
 
     async def handle_message(self, msg: InboundMessage) -> None:
         """处理单条入站消息：命令识别、Agent 处理、回复。"""
-        cancel_token = CancellationToken()
+        cancel_token = CancellationToken()  # 取消令牌，用于支持 /stop 命令中止任务
         session_id = None
         start_time = time.time()
 
@@ -196,9 +196,10 @@ class ChannelMessageHandler:
                 f"(chat={msg.chat_id}): {msg.content[:50]}..."
             )
 
+            # 移除 @机器人 的提及文本，只保留实际内容
             content = _AT_MENTION_RE.sub("", msg.content).strip()
 
-            # 限流检查
+            # 限流检查：防止单个用户短时间内发送过多消息
             if self.rate_limiter:
                 allowed, error_msg = await self.rate_limiter.check(msg.sender_id)
                 if not allowed:
@@ -206,7 +207,7 @@ class ChannelMessageHandler:
                     await self._send_reply(msg, error_msg)
                     return
 
-            # 命令分发
+            # ---- 命令分发：斜杠命令直接处理，不经过 Agent ----
             cmd = content.lower()
             if cmd in ("/new", "/newsession", "/new_session"):
                 await self._handle_new_session_command(msg)
@@ -227,30 +228,35 @@ class ChannelMessageHandler:
                 await self._handle_help_command(msg)
                 return
 
-            # Agent 处理
+            # ---- 非命令消息：交给 Agent 处理 ----
+
+            # 1. 获取或创建会话（基于 channel:chat_id 查找已有会话，没有就新建）
             session_id = await self._get_or_create_session(msg)
-            self._active_tasks[session_id] = cancel_token
+            self._active_tasks[session_id] = cancel_token  # 注册取消令牌，供 /stop 使用
             logger.debug(f"[{msg.channel}] Using session {session_id}")
 
             if cancel_token.is_cancelled:
                 return
 
+            # 2. 准备上下文：设置会话 ID、保存用户消息、加载历史记录
             self.tool_registry.set_session_id(session_id)
             await self._save_message(session_id, "user", msg.content)
 
             history = await self._get_session_history(session_id)
             if history:
-                history = history[:-1]
+                history = history[:-1]  # 排除刚刚保存的当前消息（避免重复）
 
             logger.debug(
                 f"[{msg.channel}] Agent processing with {len(history)} history messages"
             )
 
+            # 3. 调用 Agent 进行 ReAct 循环处理
             response = await self._process_with_agent(
                 session_id, msg.content, history, cancel_token,
                 channel=msg.channel, chat_id=msg.chat_id,
             )
 
+            # 4. 处理结果：检查是否被取消，否则保存并回复
             if cancel_token.is_cancelled:
                 logger.info(f"[{msg.channel}] Task cancelled for session {session_id}")
                 await self._send_reply(msg, "Task cancelled")
@@ -258,7 +264,7 @@ class ChannelMessageHandler:
 
             if response:
                 await self._save_message(session_id, "assistant", response)
-                await self._send_reply(msg, response)
+                await self._send_reply(msg, response)  # 通过出站总线发送回复
                 duration = time.time() - start_time
                 logger.info(
                     f"[{msg.channel}] Handled session {session_id} in {duration:.2f}s"
@@ -274,6 +280,7 @@ class ChannelMessageHandler:
             await self._send_reply(msg, _friendly_channel_error(str(e)))
 
         finally:
+            # 清理：移除取消令牌，释放会话的"活跃任务"状态
             if session_id and session_id in self._active_tasks:
                 del self._active_tasks[session_id]
 

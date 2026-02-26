@@ -136,14 +136,14 @@ _session_connections:
   "session-2" → {"conn-C"}              ← 李四
 ```
 
-| 方法 | 作用 | Java 类比 |
-|------|------|-----------|
-| `connect(websocket)` | 注册连接，调用 `accept()` | `@OnOpen` |
-| `disconnect(connection_id)` | 注销连接，清理会话映射 | `@OnClose` |
-| `bind_session(conn_id, session_id)` | 绑定连接到会话 | `session.getUserProperties().put()` |
-| `send_message(conn_id, msg)` | 发给单个连接 | `session.getBasicRemote().sendText()` |
-| `send_to_session(session_id, msg)` | 发给同一会话的所有连接 | `@SendTo("/topic/session")` |
-| `broadcast(msg)` | 发给所有连接 | `SimpMessagingTemplate.convertAndSend("/topic/all")` |
+| 方法                                  | 作用                 | Java 类比                                              |
+| ----------------------------------- | ------------------ | ---------------------------------------------------- |
+| `connect(websocket)`                | 注册连接，调用 `accept()` | `@OnOpen`                                            |
+| `disconnect(connection_id)`         | 注销连接，清理会话映射        | `@OnClose`                                           |
+| `bind_session(conn_id, session_id)` | 绑定连接到会话            | `session.getUserProperties().put()`                  |
+| `send_message(conn_id, msg)`        | 发给单个连接             | `session.getBasicRemote().sendText()`                |
+| `send_to_session(session_id, msg)`  | 发给同一会话的所有连接        | `@SendTo("/topic/session")`                          |
+| `broadcast(msg)`                    | 发给所有连接             | `SimpMessagingTemplate.convertAndSend("/topic/all")` |
 
 注意 `_lock` 的存在——虽然 Python 协程不会真正并行，但 `async with self._lock` 防止了多个协程交错修改字典时的不一致问题。Java 中类似 `ConcurrentHashMap` 或 `synchronized` 块。
 
@@ -356,7 +356,9 @@ async def execute_tool_with_notifications(session_id, tool_name, arguments, exec
 
 ### （3）BatchToolNotificationHandler — 批量工具通知
 
-当 AI 同时调用多个工具时，用 `BatchToolNotificationHandler` 管理：
+> **注意：此类当前未被使用。** 项目中没有任何地方引用 `BatchToolNotificationHandler`，Agent 的工具调用走的是逐个串行执行的路径（`execute_tool_with_notifications` → 单个 `tool_call` + `tool_result`）。这是为未来可能的并行工具调用预留的代码。
+
+设计意图是当 AI 同时调用多个工具时，用 `BatchToolNotificationHandler` 管理：
 
 ```python
 batch = BatchToolNotificationHandler(session_id)

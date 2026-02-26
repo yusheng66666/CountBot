@@ -63,10 +63,10 @@ class FeishuChannel(BaseChannel):
 
     def __init__(self, config: Any):
         super().__init__(config)
-        self._client = None
-        self._ws_process: Process | None = None
-        self._message_queue: Queue | None = None
-        self._processed_ids: OrderedDict[str, None] = OrderedDict()
+        self._client = None                # 飞书 API 客户端（用于发送消息、下载图片等）
+        self._ws_process: Process | None = None       # WebSocket 子进程
+        self._message_queue: Queue | None = None      # 进程间通信队列
+        self._processed_ids: OrderedDict[str, None] = OrderedDict()  # 消息去重缓存（最多 1000 条）
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
@@ -86,6 +86,7 @@ class FeishuChannel(BaseChannel):
         self._running = True
         self._loop = asyncio.get_running_loop()
 
+        # 步骤1: 创建飞书 API 客户端（用于发送消息、下载图片等，运行在主进程）
         self._client = (
             lark.Client.builder()
             .app_id(self.config.app_id)
@@ -94,31 +95,36 @@ class FeishuChannel(BaseChannel):
             .build()
         )
 
+        # 步骤2: 创建进程间通信队列（子进程收到消息后放入队列，主进程从队列读取）
         from multiprocessing import get_context
 
-        ctx = get_context("spawn")
+        ctx = get_context("spawn")  # 使用 spawn 模式，避免 fork 导致的事件循环问题
         self._message_queue = ctx.Queue(maxsize=1000)
 
+        # 步骤3: 启动 WebSocket 子进程（飞书 SDK 的 WebSocket 会创建自己的事件循环，必须隔离到独立进程）
         from backend.modules.channels.feishu_websocket_worker import run_worker
 
         self._ws_process = ctx.Process(
-            target=run_worker,
+            target=run_worker,  # 子进程入口函数
             args=(self.config.app_id, self.config.app_secret, self._message_queue),
-            daemon=True,
+            daemon=True,        # 主进程退出时自动终止子进程
             name="feishu-websocket-worker",
         )
         self._ws_process.start()
         logger.info(f"Feishu WebSocket worker started (PID: {self._ws_process.pid})")
 
+        # 步骤4: 启动消息队列读取任务（异步轮询 Queue，将消息分发到 _process_message）
         asyncio.create_task(self._read_ws_messages())
 
+        # 步骤5: 保持 start() 不返回（ChannelManager 用 start() 是否返回来判断渠道是否断开）
         while self._running:
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
         """停止飞书机器人。"""
-        self._running = False
+        self._running = False  # 通知 start() 中的 while 循环退出
 
+        # 1. 停止 WebSocket 子进程：先 terminate，5秒超时后 kill
         if self._ws_process:
             try:
                 logger.info("Terminating WebSocket worker process...")
@@ -132,6 +138,7 @@ class FeishuChannel(BaseChannel):
             except Exception as e:
                 logger.error(f"Error stopping WebSocket process: {e}")
 
+        # 2. 清空并关闭消息队列
         if self._message_queue:
             try:
                 while not self._message_queue.empty():
@@ -159,12 +166,14 @@ class FeishuChannel(BaseChannel):
         try:
             while self._running:
                 try:
+                    # Queue.get() 是阻塞操作，用 run_in_executor 放到线程池执行，避免阻塞 asyncio 事件循环
                     msg_data = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: self._message_queue.get(timeout=1.0)
                     )
                     if msg_data and msg_data.get("type") == "message":
                         await self._process_message(msg_data)
                 except Exception as e:
+                    # Queue 超时是正常的（没有新消息），不需要打日志
                     if "Empty" not in str(e) and "timeout" not in str(e).lower():
                         logger.debug(f"Queue read error: {e}")
                     await asyncio.sleep(0.1)
@@ -182,38 +191,45 @@ class FeishuChannel(BaseChannel):
         try:
             message_id = msg_data["message_id"]
 
-            # 消息去重
+            # 消息去重：用 OrderedDict 缓存已处理的消息 ID，最多保留 1000 条（FIFO 淘汰）
             if message_id in self._processed_ids:
                 return
             self._processed_ids[message_id] = None
             while len(self._processed_ids) > 1000:
-                self._processed_ids.popitem(last=False)
+                self._processed_ids.popitem(last=False)  # 淘汰最早的
 
             sender_id = msg_data["sender_id"]
             chat_id = msg_data["chat_id"]
-            chat_type = msg_data["chat_type"]
-            msg_type = msg_data["msg_type"]
+            chat_type = msg_data["chat_type"]   # "p2p"（私聊）或 "group"（群聊）
+            msg_type = msg_data["msg_type"]     # "text" / "image" / "audio" / "file" 等
 
+            # 收到消息后自动点赞，让用户知道 Bot 已收到
             await self._add_reaction(message_id, "THUMBSUP")
 
             media_files = []
 
+            # 根据消息类型分别处理
             if msg_type == "text":
+                # 飞书文本消息的 content 是 JSON 格式：{"text": "实际内容"}
                 try:
                     content = json.loads(msg_data["content"]).get("text", "")
                 except json.JSONDecodeError:
                     content = msg_data["content"] or ""
             elif msg_type == "image":
+                # 图片消息：下载到本地，生成图片分析命令交给 Agent
                 content, media_files = await self._handle_image_message(
                     msg_data["content"], message_id
                 )
             else:
+                # 其他类型：转为占位文本（如 [语音]、[文件]）
                 content = _MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
             if not content:
                 return
 
+            # 群聊回复到群，私聊回复到个人
             reply_to = chat_id if chat_type == "group" else sender_id
+            # 调用基类的 _handle_message：鉴权 → 封装 InboundMessage → 回调到 ChannelManager
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -387,24 +403,37 @@ class FeishuChannel(BaseChannel):
         }
 
     def _build_card_elements(self, content: str) -> list[dict]:
-        """将内容拆分为 markdown + 表格元素用于飞书卡片。"""
-        elements = []
-        last_end = 0
+        """将内容拆分为 markdown 段落 + 飞书原生表格元素，用于卡片消息。
 
+        例如 Agent 回复：
+            "以下是结果：\n| 城市 | 温度 |\n|---|---|\n| 北京 | 25℃ |\n更多信息请查看..."
+        会被拆成 3 个元素：
+            1. markdown 元素："以下是结果："
+            2. table 元素：飞书原生表格（不是等宽字体文本）
+            3. markdown 元素："更多信息请查看..."
+        """
+        elements = []
+        last_end = 0  # 记录上一个表格结束的位置
+
+        # 用正则找出内容中所有的 markdown 表格
         for m in self._TABLE_RE.finditer(content):
+            # 表格前面的文字 → markdown 元素
             before = content[last_end : m.start()].strip()
             if before:
                 elements.append({"tag": "markdown", "content": before})
+            # 表格本身 → 尝试解析为飞书原生 table 元素，解析失败则退回 markdown
             elements.append(
                 self._parse_md_table(m.group(1))
                 or {"tag": "markdown", "content": m.group(1)}
             )
             last_end = m.end()
 
+        # 最后一个表格之后的剩余文字 → markdown 元素
         remaining = content[last_end:].strip()
         if remaining:
             elements.append({"tag": "markdown", "content": remaining})
 
+        # 如果内容中没有表格，整体作为一个 markdown 元素
         return elements or [{"tag": "markdown", "content": content}]
 
     # ------------------------------------------------------------------
@@ -418,21 +447,25 @@ class FeishuChannel(BaseChannel):
             return
 
         try:
+            # 判断接收者类型：oc_ 开头是群聊 ID，否则是个人 open_id
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
 
             if msg.media:
                 await self._send_with_media(msg, receive_id_type)
             else:
+                # 使用飞书卡片消息格式发送（支持 Markdown + 原生表格渲染）
                 await self._send_card(msg.chat_id, msg.content, receive_id_type)
         except Exception as e:
             logger.error(f"Error sending Feishu message: {e}")
 
     async def _send_card(self, chat_id: str, content: str, receive_id_type: str) -> None:
         """发送卡片消息（支持 markdown + 表格）。"""
+        # 将回复内容拆分为 markdown 段落 + 飞书原生表格元素
         elements = self._build_card_elements(content)
         card = {"config": {"wide_screen_mode": True}, "elements": elements}
         card_json = json.dumps(card, ensure_ascii=False)
 
+        # 使用 msg_type="interactive" 发送卡片消息
         request = (
             CreateMessageRequest.builder()
             .receive_id_type(receive_id_type)
@@ -483,13 +516,14 @@ class FeishuChannel(BaseChannel):
     async def _send_image(
         self, chat_id: str, image_path: str, receive_id_type: str
     ) -> None:
-        """上传并发送图片。"""
+        """上传并发送图片（两步：先上传获取 image_key，再用 image_key 发送消息）。"""
         try:
             image_file = Path(image_path)
             if not image_file.exists():
                 logger.error(f"Image not found: {image_path}")
                 return
 
+            # 第一步：上传图片到飞书服务器，获取 image_key
             upload_request = (
                 CreateImageRequest.builder()
                 .request_body(
@@ -509,6 +543,7 @@ class FeishuChannel(BaseChannel):
             image_key = upload_response.data.image_key
             logger.info(f"Image uploaded: {image_key}")
 
+            # 第二步：用 image_key 发送图片消息
             content = json.dumps({"image_key": image_key})
             request = (
                 CreateMessageRequest.builder()
@@ -534,7 +569,7 @@ class FeishuChannel(BaseChannel):
     async def _send_file(
         self, chat_id: str, file_path: str, receive_id_type: str
     ) -> None:
-        """上传并发送文件。"""
+        """上传并发送文件（两步：先上传获取 file_key，再用 file_key 发送消息）。"""
         try:
             file = Path(file_path)
             if not file.exists():
@@ -590,7 +625,12 @@ class FeishuChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def test_connection(self) -> dict[str, Any]:
-        """测试飞书连接（获取 tenant_access_token 验证凭据）。"""
+        """测试飞书连接（获取 tenant_access_token 验证凭据）。
+
+        不启动 WebSocket，仅通过 HTTP 请求验证 app_id 和 app_secret 是否有效。
+        前端设置页面点击"测试连接"时调用。
+        """
+        # 前置校验：格式检查
         if not self.config.app_id or not self.config.app_secret:
             return {"success": False, "message": "App ID or App Secret not configured"}
 
@@ -607,6 +647,7 @@ class FeishuChannel(BaseChannel):
         try:
             import httpx
 
+            # 请求飞书开放平台获取 tenant_access_token，验证凭据是否正确
             async with httpx.AsyncClient(timeout=5.0) as http_client:
                 response = await http_client.post(
                     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",

@@ -129,6 +129,22 @@ class CronJobDetailResponse(BaseModel):
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+
+async def _notify_scheduler_reschedule():
+    """通知调度器重新计算定时器（创建/更新/删除任务后调用）"""
+    try:
+        from backend.app import app
+        scheduler = getattr(app.state, 'cron_scheduler', None)
+        if scheduler:
+            await scheduler.trigger_reschedule()
+    except Exception as e:
+        logger.warning(f"Failed to notify scheduler reschedule: {e}")
+
+
+# ============================================================================
 # Cron Endpoints
 # ============================================================================
 
@@ -263,7 +279,9 @@ async def create_cron_job(
             chat_id=request.chat_id,
             deliver_response=request.deliver_response,
         )
-        
+
+        await _notify_scheduler_reschedule()
+
         return CronJobResponse(
             job=CronJobInfo(
                 id=job.id,
@@ -336,13 +354,15 @@ async def update_cron_job(
             chat_id=request.chat_id,
             deliver_response=request.deliver_response,
         )
-        
+
         if job is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Cron job '{job_id}' not found"
             )
-        
+
+        await _notify_scheduler_reschedule()
+
         return CronJobResponse(
             job=CronJobInfo(
                 id=job.id,
@@ -362,7 +382,7 @@ async def update_cron_job(
                 created_at=_to_shanghai_iso(job.created_at),
             )
         )
-        
+
     except HTTPException:
         raise
     except ValueError as e:
@@ -405,13 +425,15 @@ async def delete_cron_job(
         
         cron_service = CronService(db)
         success = await cron_service.delete_job(job_id)
-        
+
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Cron job '{job_id}' not found"
             )
-        
+
+        await _notify_scheduler_reschedule()
+
         return DeleteCronJobResponse(success=True)
         
     except HTTPException:
